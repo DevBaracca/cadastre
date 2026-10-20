@@ -1,0 +1,13 @@
+# Données générées par analyse-cadastrale.py
+.cache_cadastre/
+resultats_*/
+
+# Cache Python
+__pycache__/
+
+# Données brutes DVF (plusieurs Go — hors GitHub)
+dvf_2021-2025.csv
+cadastre-*.json
+
+# Copies de travail
+* - Copie.py
