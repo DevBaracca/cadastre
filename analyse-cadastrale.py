@@ -32,7 +32,7 @@ Usage :
     python analyse-cadastrale.py 10000      # Troyes
     python analyse-cadastrale.py 75001     # Paris 1er
     Sans argument : 10000 (Troyes) par défaut.
-    ⚠ Argument = CODE POSTAL uniquement (pas le code INSEE) : un code INSEE
+    [!] Argument = CODE POSTAL uniquement (pas le code INSEE) : un code INSEE
     (ex. 10387) est rejeté avec un message d'aide.
 """
 
@@ -44,6 +44,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -53,11 +54,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+# Console Windows (cp1252) : un caractère non représentable ne doit pas
+# faire planter le script (UnicodeEncodeError) — repli sur « ? ».
+if sys.platform == "win32":
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+
 BASE_URL = "https://cadastre.data.gouv.fr/data/etalab-cadastre/latest/geojson/communes"
 
 # DVF : demandes de valeurs foncières géolocalisées (data.gouv.fr).
 # Fichier unique couvrant janvier 2021 - décembre 2025 (CSV gzippé).
-# ⚠ L'identifiant de ressource DVF change à chaque millésime : si l'URL
+# [!] L'identifiant de ressource DVF change à chaque millésime : si l'URL
 # fixe échoue, le script interroge l'API data.gouv.fr pour trouver le
 # lien le plus récent (voir trouver_url_dvf).
 DVF_URL_FIXE = ("https://static.data.gouv.fr/resources/"
@@ -76,6 +83,51 @@ CACHE_DIR = ".cache_cadastre"
 
 ARG_CP = sys.argv[1] if len(sys.argv) > 1 else "10000"
 
+# Certains serveurs rejettent le User-Agent « Python-urllib » par défaut.
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Safari/537.36")
+
+
+def _ouvrir_url(url, timeout=60):
+    """Ouvre une URL avec un User-Agent de navigateur."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+_dernier_telechargement = 0.0  # throttling entre deux requêtes (rate-limiting)
+
+
+def _telecharger_fichier(url, dest, tentatives=6, timeout=300):
+    """Télécharge url vers dest avec plusieurs tentatives espacées
+    (les serveurs ferment parfois la connexion : WinError 10054,
+    timeouts…). Les requêtes sont espacées d'au moins 1 s pour éviter
+    le rate-limiting. Renvoie True si réussi, False sinon."""
+    global _dernier_telechargement
+    for essai in range(1, tentatives + 1):
+        reste = 1.0 - (time.monotonic() - _dernier_telechargement)
+        if reste > 0:
+            time.sleep(reste)
+        _dernier_telechargement = time.monotonic()
+        try:
+            with _ouvrir_url(url, timeout=timeout) as rep, \
+                    open(dest, "wb") as f:
+                shutil.copyfileobj(rep, f)
+            return True
+        except Exception as exc:
+            if os.path.exists(dest):
+                os.remove(dest)
+            if essai < tentatives:
+                delai = 5 * essai  # 5 s, 10 s, 15 s, 20 s, 25 s
+                print(f"[!] {os.path.basename(dest)} : essai {essai}/"
+                      f"{tentatives} ({exc}), nouvel essai dans {delai} s…",
+                      file=sys.stderr)
+                time.sleep(delai)
+            else:
+                print(f"[!] {os.path.basename(dest)} indisponible ({exc})",
+                      file=sys.stderr)
+    return False
+
 
 def resoudre_code_postal(cp):
     """Résout un CODE POSTAL via geo.api.gouv.fr (codes INSEE refusés).
@@ -89,13 +141,13 @@ def resoudre_code_postal(cp):
 
     url = (f"https://geo.api.gouv.fr/communes?codePostal={urllib.parse.quote(cp)}"
            f"&fields=code,nom,codeDepartement&format=json")
-    with urllib.request.urlopen(url, timeout=30) as rep:
+    with _ouvrir_url(url, timeout=30) as rep:
         communes = json.load(rep)
     if not communes:
         # Le paramètre répondrait aussi à un code INSEE : vérifions ce cas
         url2 = (f"https://geo.api.gouv.fr/communes?code={urllib.parse.quote(cp)}"
                 f"&fields=code,nom&format=json")
-        with urllib.request.urlopen(url2, timeout=30) as rep:
+        with _ouvrir_url(url2, timeout=30) as rep:
             par_insee = json.load(rep)
         if par_insee:
             raise SystemExit(
@@ -133,11 +185,10 @@ def telecharger_commune(dep, code_insee, couche):
     dest_gz = os.path.join(CACHE_DIR, gz)
     dest_js = os.path.join(CACHE_DIR, js)
     url = f"{BASE_URL}/{dep}/{code_insee}/{gz}"
+    print(f"[>>] Téléchargement : {gz}")
+    if not _telecharger_fichier(url, dest_gz, timeout=300):
+        return None
     try:
-        print(f"[↓] Téléchargement : {gz}")
-        with urllib.request.urlopen(url, timeout=300) as rep, \
-                open(dest_gz, "wb") as f:
-            shutil.copyfileobj(rep, f)
         with gzip.open(dest_gz, "rb") as f_in, open(dest_js, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out)
         os.remove(dest_gz)
@@ -145,7 +196,8 @@ def telecharger_commune(dep, code_insee, couche):
     except Exception as exc:
         if os.path.exists(dest_gz):
             os.remove(dest_gz)
-        print(f"[!] {gz} indisponible ({exc})", file=sys.stderr)
+        print(f"[!] {gz} illisible après téléchargement ({exc})",
+              file=sys.stderr)
         return None
 
 
@@ -173,16 +225,17 @@ def trouver_url_dvf():
     d'abord, sinon interrogation de l'API data.gouv.fr (dernier millésime).
     Renvoie None si indisponible."""
     try:
-        req = urllib.request.Request(DVF_URL_FIXE, method="HEAD")
+        req = urllib.request.Request(DVF_URL_FIXE, method="HEAD",
+                                     headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=30) as rep:
             if rep.status == 200:
                 return DVF_URL_FIXE
     except Exception:
         pass
-    print("[⋯] Recherche du DVF géolocalisé via l'API data.gouv.fr...")
+    print("[...] Recherche du DVF géolocalisé via l'API data.gouv.fr...")
     try:
         url = f"https://www.data.gouv.fr/api/1/datasets/{DVF_API_DATASET}/"
-        with urllib.request.urlopen(url, timeout=30) as rep:
+        with _ouvrir_url(url, timeout=30) as rep:
             dataset = json.load(rep)
         candidats = []
         for res in dataset.get("resources", []):
@@ -226,19 +279,20 @@ def charger_dvf(deps):
             return None
         cle = _cle_cache(url)
         gz = os.path.join(CACHE_DIR, "dvf.csv.gz")
-        print(f"[↓] Téléchargement DVF {DVF_ANNEE} (France entière, "
+        print(f"[>>] Téléchargement DVF {DVF_ANNEE} (France entière, "
               f"~500 Mo) : {url}")
+        if not _telecharger_fichier(url, gz, tentatives=6, timeout=1800):
+            print("[!] DVF indisponible : colonnes de prix vides.",
+                  file=sys.stderr)
+            return None
         try:
-            with urllib.request.urlopen(url, timeout=1800) as rep, \
-                    open(gz, "wb") as f:
-                shutil.copyfileobj(rep, f)
             with gzip.open(gz, "rb") as f_in, open(national, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
             os.remove(gz)
             source = national
         except Exception as exc:
-            print(f"[!] DVF indisponible ({exc}) : colonnes de prix vides.",
-                  file=sys.stderr)
+            print(f"[!] DVF illisible après téléchargement ({exc}) : "
+                  f"colonnes de prix vides.", file=sys.stderr)
             if os.path.exists(gz):
                 os.remove(gz)
             return None
@@ -246,12 +300,12 @@ def charger_dvf(deps):
     cache_filtre = os.path.join(
         CACHE_DIR, f"dvf_filtre_{cle}_dep{'+'.join(deps)}.csv")
     if os.path.exists(cache_filtre):
-        print(f"[⋯] Lecture du cache DVF filtré : {cache_filtre}")
+        print(f"[...] Lecture du cache DVF filtré : {cache_filtre}")
         dvf = pd.read_csv(cache_filtre, dtype={"id_parcelle": str,
                                                "code_departement": str},
                           low_memory=False)
     else:
-        print(f"[⋯] Lecture du fichier DVF et filtrage sur le(s) "
+        print(f"[...] Lecture du fichier DVF et filtrage sur le(s) "
               f"département(s) {'/'.join(deps)}...")
         try:
             morceaux = []
@@ -269,14 +323,14 @@ def charger_dvf(deps):
             print(f"[!] Colonnes DVF inattendues ({exc}).", file=sys.stderr)
             return None
         dvf.to_csv(cache_filtre, index=False)
-        print(f"[✓] Cache DVF filtré : {cache_filtre} ({len(dvf):,} lignes)")
+        print(f"[OK] Cache DVF filtré : {cache_filtre} ({len(dvf):,} lignes)")
 
     dvf = dvf.dropna(subset=["id_parcelle", "valeur_fonciere"])
     # Identifiants de parcelles : 14 caractères (commune 5 + préfixe 3 +
     # section 2 + numéro 4) dans le DVF comme dans le cadastre Etalab.
     dvf["id_parcelle"] = (dvf["id_parcelle"].astype(str)
                           .str.replace("_", "", regex=False).str.zfill(14))
-    print(f"[✓] {len(dvf):,} mutations retenues pour le(s) département(s) "
+    print(f"[OK] {len(dvf):,} mutations retenues pour le(s) département(s) "
           f"{'/'.join(deps)}.")
     return dvf
 
@@ -292,8 +346,20 @@ def requete_wfs_gpu(couche, cql, page=5000):
     while True:
         params["STARTINDEX"] = str(debut)
         url = GPU_WFS + "?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(url, timeout=300) as rep:
-            data = json.load(rep)
+        data = None
+        for essai in range(1, 5):
+            try:
+                with _ouvrir_url(url, timeout=300) as rep:
+                    data = json.load(rep)
+                break
+            except Exception as exc:
+                if essai < 4:
+                    print(f"[!] WFS {couche} (page {debut}) : essai "
+                          f"{essai}/4 ({exc}), nouvel essai dans "
+                          f"{5 * essai} s…", file=sys.stderr)
+                    time.sleep(5 * essai)
+        if data is None:
+            raise RuntimeError(f"WFS {couche} indisponible après 4 essais")
         lot = data.get("features", [])
         features.extend(lot)
         if len(lot) < page:
@@ -338,7 +404,7 @@ def telecharger_reglement_gpu(gpu_doc_id):
             return os.path.join(CACHE_DIR, f)
     try:
         url = f"{GPU_API}/document/{gpu_doc_id}/files"
-        with urllib.request.urlopen(url, timeout=60) as rep:
+        with _ouvrir_url(url, timeout=60) as rep:
             fichiers = json.load(rep)
     except Exception as exc:
         print(f"[!] API du Géoportail de l'urbanisme indisponible ({exc})",
@@ -361,17 +427,10 @@ def telecharger_reglement_gpu(gpu_doc_id):
     nom = choix.get("name") or choix.get("fileName")
     dest = os.path.join(CACHE_DIR, f"reglement_{gpu_doc_id}_{nom}")
     url = f"{GPU_API}/document/{gpu_doc_id}/files/{urllib.parse.quote(nom)}"
-    try:
-        print(f"[↓] Téléchargement du règlement : {nom}")
-        with urllib.request.urlopen(url, timeout=600) as rep, \
-                open(dest, "wb") as f:
-            shutil.copyfileobj(rep, f)
+    print(f"[>>] Téléchargement du règlement : {nom}")
+    if _telecharger_fichier(url, dest, timeout=600):
         return dest
-    except Exception as exc:
-        print(f"[!] Règlement indisponible ({exc})", file=sys.stderr)
-        if os.path.exists(dest):
-            os.remove(dest)
-        return None
+    return None
 
 
 def _lire_texte_pdf(pdf_path):
@@ -396,6 +455,76 @@ def _lire_texte_pdf(pdf_path):
         return None
     # Caractères non imprimables (polices PDF exotiques) -> espaces
     return "".join(c if c.isprintable() else " " for c in texte)
+
+
+def _est_clause_ppri(texte):
+    """Vrai si le texte relève d'une clause PPRI (plan de prévention des
+    risques d'inondation) : limitation d'emprise liée au risque
+    (« sous réserve d'en limiter la vulnérabilité »), à ne pas confondre
+    avec une règle d'emprise au sol du PLU."""
+    return bool(re.search(r"(?i)vuln[ée]rab|ne pas augmenter|aggraver|"
+                          r"al[ée]a|inondab|crue", texte))
+
+
+def _taux_emprise_dans_bloc(bloc):
+    """Premier pourcentage d'un bloc de texte rattaché à une emprise au
+    sol : la phrase précédant le % doit mentionner l'emprise (ou le CES).
+    Un article intitulé « emprise au sol » peut ne contenir en réalité
+    qu'un taux d'imperméabilisation (ex. Creney, zone UG : « La surface
+    du sol imperméabilisée ne doit pas dépasser 60 % », à ne pas confondre
+    avec l'emprise au sol des constructions) : ces pourcentages sont
+    ignorés, de même que les clauses PPRI (risque inondation). En second
+    recours, un pourcentage directement accolé à la locution
+    (« EMPRISE AU SOL : 40 % ») ou un coefficient décimal
+    (« coefficient d'emprise au sol : 0,4 » -> 40 %) est retenu. Enfin,
+    « il n'est pas fixé de règles » ou « non réglementée » dans une
+    sous-section « emprise au sol » signifie l'absence de limite :
+    100 %. Renvoie None si aucun taux n'est trouvé."""
+    for m in re.finditer(r"(\d+(?:[.,]\d+)?)(?:\s+(\d{1,2}))?\s*%", bloc):
+        # La fenêtre est la phrase précédant le % (les tirets ne sont pas
+        # des séparateurs : les césures PDF produisent « encorbel - lements »).
+        debut = max(bloc.rfind(".", 0, m.start()),
+                    bloc.rfind(";", 0, m.start()),
+                    bloc.rfind("\u2014", 0, m.start()))
+        fenetre = bloc[debut + 1:m.start()].lower()
+        if "imperméabilis" in fenetre or "impermeabilis" in fenetre:
+            continue  # taux d'imperméabilisation, pas une emprise
+        if not re.search(r"emprise|coefficient|C\.?\s*E\.?\s*S", fenetre):
+            continue
+        if _est_clause_ppri(bloc[m.end():m.end() + 200]):
+            continue  # clause PPRI (risque inondation), pas une règle PLU
+        # « 6 0 % » : artefact d'extraction PDF pour « 60 % »
+        valeur = m.group(1) + (m.group(2) or "")
+        taux = float(valeur.replace(",", "."))
+        if taux > 0:
+            return taux
+    m = re.search(r"(?i)emprise\s+au\s+sol\s*[-:\u2013\u2014]?\s*"
+                  r"(\d+(?:[.,]\d+)?)\s*%", bloc)
+    if m and not _est_clause_ppri(bloc[m.end():m.end() + 200]):
+        return float(m.group(1).replace(",", "."))
+    # Coefficient décimal : « coefficient d'emprise au sol : 0,4 » -> 40 %
+    m = re.search(r"(?i)(?:coefficient|taux)\s+(?:d.?emprise|de l.?emprise)"
+                  r"[^0-9]{0,60}?(\d+(?:[.,]\d+)?)", bloc)
+    if not m:
+        m = re.search(r"(?i)\bC\.?\s*E\.?\s*S\.?\b[^0-9]{0,30}?"
+                      r"(\d+(?:[.,]\d+)?)", bloc)
+    if m:
+        v = float(m.group(1).replace(",", "."))
+        return v * 100 if v <= 1 else v
+    # « Il n'est pas fixé de règles » dans la sous-section « emprise au
+    # sol » : aucune limite -> 100 % (valable uniquement dans ce contexte)
+    if re.search(r"(?i)emprise\s+au\s+sol.{0,120}?"
+                 r"(pas\s+fix|pas\s+de\s+r[eè]gle)", bloc):
+        return 100.0
+    # « Non réglementée » (même sens : aucune limite -> 100 %). Le
+    # contexte est la locution « emprise au sol » ou, dans les
+    # règlements au titre du RNU, « possibilités maximales d'occupation
+    # du sol » (article 14 ; ex. Montsuzain : « Article non réglementé »).
+    if re.search(r"(?i)(?:emprise\s+au\s+sol|possibilit[eé]s?\s+maximales?"
+                 r"\s+d.?occupation\s+du\s+sol).{0,120}?"
+                 r"(?:non|n'est\s+pas|pas)\s+r[eéè]glement", bloc):
+        return 100.0
+    return None
 
 
 def _parse_article_emprise(section):
@@ -462,38 +591,133 @@ def _parse_article_emprise(section):
             if bornes and len(bornes) == len(valeurs):
                 regles["tranches"] = sorted(zip(bornes, valeurs))
     if regles["tranches"] is None and not regles["alias"]:
-        # Taux unique : « limitée à 40% de la superficie de la parcelle »
-        # (le premier pourcentage de l'article est la règle générale).
-        m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", section)
-        if m:
-            regles["taux"] = float(m.group(1).replace(",", "."))
+        # Taux unique : « limitée à 40% de la superficie de la parcelle ».
+        taux = _taux_emprise_dans_bloc(section)
+        if taux is not None:
+            regles["taux"] = taux
     return regles
 
 
 def extraire_taux_emprise_reglement(pdf_path):
     """Taux d'emprise au sol par zone, extraits du règlement (PDF) du PLU.
-    Renvoie {code_article: règles} (voir _parse_article_emprise), ou None
-    si le règlement est illisible."""
+    Renvoie {code_zone: règles} (voir _parse_article_emprise), ou None
+    si le règlement est illisible.
+
+    Deux repérages complémentaires, car les mises en page sont variées :
+    1. les articles dont l'intitulé porte sur l'emprise au sol — ou sur
+       la « volumétrie et implantation » et les « possibilités maximales
+       d'occupation du sol » (PMOS), où la règle figure en sous-section :
+       « ARTICLE UB 10 : EMPRISE AU SOL ... » (Troyes),
+       « ARTICLE 9 - EMPRISE AU SOL ... » (Creney),
+       « ARTICLE U4 : VOLUMETRIE ET IMPLANTATION ... » (Vailly) ;
+       l'analyse article par article gère aussi les paliers selon la
+       surface du terrain et les renvois entre secteurs ;
+    2. la recherche directe de la locution « emprise au sol » : le
+       paragraphe qui suit contient le pourcentage. La zone est alors
+       celle de l'article ou de l'en-tête de section en cours
+       (« 8 UC PERSPECTIVES ... », « UG ARTICLE 6 - ... »,
+       « ARTICLE U4 : ... »)."""
     texte = _lire_texte_pdf(pdf_path)
     if not texte:
         return None
+    if len(texte) < 200:
+        print("[!] Règlement illisible (PDF probablement scanné, sans "
+              "couche de texte).", file=sys.stderr)
+        return None
     texte = re.sub(r"\s+", " ", texte)
-    articles = {}
-    for m in re.finditer(r"ARTICLE\s+([A-Z0-9]{1,8})\s+(\d+)\s*:\s*([^:]{0,80})",
-                         texte):
-        code, titre = m.group(1), m.group(3)
-        if not re.search(r"EMPRISE AU SOL|COEFFICIENT D.?EMPRISE|"
-                         r"TAUX D.?EMPRISE", titre, re.I):
+    tiret = r"[-:\u2013\u2014]"
+    # Code de zone : lettres et chiffres, la lettre en première ou
+    # deuxième position (« UB », « 1AU »), collée ou non au numéro
+    # d'article (« ARTICLE U4 : », « ARTICLE 1AU 9 - »).
+    zone_code = r"(?:[A-Z][A-Z0-9]{0,7}|\d[A-Z][A-Z0-9]{0,6})"
+    num = r"\d{1,2}"
+    # Marqueurs de zone (position, zone) : en-têtes de section et
+    # intitulés d'articles portant le code de zone (« 8 UC PERSPECTIVES »,
+    # « 12 UC ARTICLE 9 - », « ARTICLE U4 : »,
+    # « DISPOSITIONS APPLICABLES A LA ZONE UCA »).
+    entetes = []
+    for m in re.finditer(r"\b\d{1,2}\s+([A-Z0-9]{1,6})\s+PERSPECTIVES", texte):
+        entetes.append((m.start(), m.group(1).upper()))
+    for m in re.finditer(r"\b\d{1,2}\s+([A-Z0-9]{1,6})\s+ARTICLE\s+" + num
+                         + r"\s*" + tiret, texte):
+        entetes.append((m.start(), m.group(1).upper()))
+    for m in re.finditer(r"ARTICLE\s+(" + zone_code + r")\s*" + num + r"\s*"
+                         + tiret, texte):
+        entetes.append((m.start(), m.group(1).upper()))
+    for m in re.finditer(r"(?i)DISPOSITIONS APPLICABLES A LA ZONE\s+"
+                         r"([A-Z0-9]{1,6})(?![A-Z0-9'])", texte):
+        entetes.append((m.start(), m.group(1).upper()))
+    # Ne garder que les codes de zone vraisemblables : au moins une lettre,
+    # pas un numéro de partie en chiffres romains (I, II, III...) ni une
+    # référence légale d'article (« ARTICLE L130-1 » -> « L13 »).
+    entetes = [(pos, z) for pos, z in entetes
+               if re.search(r"[A-Z]", z) and not re.fullmatch(r"[IVX]+", z)
+               and not re.fullmatch(r"[LR]\d+", z)]
+    entetes.sort()
+
+    def zone_du_contexte(pos):
+        """Dernière zone des marqueurs précédant la position."""
+        zone = ""
+        for debut, z in entetes:
+            if debut >= pos:
+                break
+            zone = z
+        return zone
+
+    # 1. Articles portant sur l'emprise au sol
+    titre_emprise = re.compile(
+        r"EMPRISE AU SOL|COEFFICIENT D.?EMPRISE|TAUX D.?EMPRISE|"
+        r"POSSIBILITES MAXIMALES D.?OCCUPATION DU SOL|"
+        r"VOLUMETRIE.{0,8}IMPLANTATION", re.I)
+    # L'intitulé ne doit pas avaler l'article suivant (« ARTICLE ... »)
+    article_re = re.compile(r"ARTICLE\s+(?:(" + zone_code + r")\s*)?(" + num
+                            + r")\s*" + tiret
+                            + r"\s*((?:(?!ARTICLE\b)[^:-]){0,80})")
+    article_suivant = re.compile(r"ARTICLE\s+(?:" + zone_code + r"\s*)?"
+                                 + num + r"\s*" + tiret)
+    candidats = []  # (position, zone, bloc, article_complet)
+    for m in article_re.finditer(texte):
+        if not titre_emprise.search(m.group(3)):
             continue
-        nxt = re.search(r"ARTICLE\s+[A-Z0-9]{1,8}\s+\d+\s*:", texte[m.end():])
-        fin = m.end() + (nxt.start() if nxt else 3000)
-        articles[code] = _parse_article_emprise(texte[m.start():fin])
+        zone = (m.group(1) or zone_du_contexte(m.start()) or "").upper()
+        if not zone:
+            continue
+        nxt = article_suivant.search(texte, m.end())
+        fin = nxt.start() if nxt else min(m.end() + 3000, len(texte))
+        candidats.append((m.start(), zone, texte[m.start():fin], True))
+    # 2. Locution « emprise au sol » : le paragraphe qui suit contient le
+    #    taux (le bloc reprend un peu de contexte avant la locution)
+    for m in re.finditer(r"(?i)emprise\s+au\s+sol", texte):
+        zone = zone_du_contexte(m.start()).upper()
+        if not zone:
+            continue
+        debut = max(0, m.start() - 80)
+        fin = min(m.end() + 250, len(texte))
+        candidats.append((m.start(), zone, texte[debut:fin], False))
+    candidats.sort()
+
+    articles = {}
+    for _, zone, bloc, article_complet in candidats:
+        precedent = articles.get(zone)
+        if precedent is not None and (precedent["taux"] is not None
+                                     or precedent["tranches"]
+                                     or precedent["alias"]):
+            continue  # une règle est déjà connue pour cette zone
+        if article_complet:
+            regles = _parse_article_emprise(bloc)
+        else:
+            # Bloc court (locution seule) : taux simple, sans paliers
+            regles = {"taux": _taux_emprise_dans_bloc(bloc),
+                      "tranches": None, "alias": {}}
+        if precedent is None or regles["taux"] is not None \
+                or regles["tranches"] or regles["alias"]:
+            articles[zone] = regles
     if not articles:
         print("[!] Aucune règle d'emprise au sol trouvée dans le règlement.",
               file=sys.stderr)
         return None
-    print(f"[i] Règlement : {len(articles)} articles « emprise au sol » lus "
-          f"({', '.join(sorted(articles))}).")
+    print(f"[i] Règlement : règles d'emprise au sol pour {len(articles)} "
+          f"zones ({', '.join(sorted(articles))}).")
     return articles
 
 
@@ -566,7 +790,7 @@ def main():
     if not fichiers_parcelles:
         raise SystemExit("[!] Aucune donnée cadastrale récupérable pour ce code postal.")
 
-    print("[⋯] Chargement des parcelles...")
+    print("[...] Chargement des parcelles...")
     morceaux = []
     for f in fichiers_parcelles:
         gdf = gpd.read_file(f)
@@ -575,7 +799,7 @@ def main():
         morceaux.append(gdf)
     parcelles = pd.concat(morceaux, ignore_index=True)
     parcelles = reparer_geometries(parcelles)
-    print(f"[✓] {len(parcelles):,} parcelles chargées.")
+    print(f"[OK] {len(parcelles):,} parcelles chargées.")
 
     parcelles["surface_m2"] = parcelles.geometry.area
     parcelles = parcelles[~parcelles.geometry.isna() & ~parcelles.geometry.is_empty]
@@ -634,7 +858,7 @@ def main():
     fig2.tight_layout()
     fig2.savefig(os.path.join(OUT_DIR, "histogramme_log.png"), dpi=150)
     plt.close(fig2)
-    print("[✓] Histogrammes exportés.")
+    print("[OK] Histogrammes exportés.")
 
     # -------------------------------------------------- 4. Emprise bâtie par parcelle
     parcelles["surface_batie_m2"] = 0.0
@@ -653,9 +877,9 @@ def main():
             batiments = batiments[~batiments.geometry.isna()
                                   & ~batiments.geometry.is_empty]
             batiments = reparer_geometries(batiments)
-            print(f"[✓] {len(batiments):,} bâtiments chargés.")
+            print(f"[OK] {len(batiments):,} bâtiments chargés.")
 
-            print("[⋯] Attribution bâtiments → parcelles...")
+            print("[...] Attribution bâtiments -> parcelles...")
             batiments_k = batiments[["geometry"]].copy()
             batiments_k.insert(0, "id_batiment", range(len(batiments_k)))
             parcelles_k = parcelles[["id", "geometry"]].rename(
@@ -690,7 +914,7 @@ def main():
                                        errors="ignore")
             nb_baties = len(emprise)
             emprise_totale = emprise["surface_batie_m2"].sum()
-            print(f"[✓] {nb_baties:,} parcelles bâties identifiées.")
+            print(f"[OK] {nb_baties:,} parcelles bâties identifiées.")
             stats += (f"{'=' * 55}\n"
                       f"EMPRISE AU SOL BÂTIE\n{'=' * 55}\n"
                       f"Emprise bâtie totale     : "
@@ -748,7 +972,7 @@ def main():
                   f"{tableau['prix_m2_bati'].median():>13,.0f} €/m²\n")
 
     # -------------------------------------------------- 5b. PLU : zones constructibles + emprise au sol
-    print("[⋯] Interrogation du Géoportail de l'urbanisme (PLU)...")
+    print("[...] Interrogation du Géoportail de l'urbanisme (PLU)...")
     try:
         partitions = {f"DU_{c}" for c in codes_insee}
         minx, miny, maxx, maxy = parcelles.to_crs(4326).total_bounds
@@ -769,16 +993,38 @@ def main():
         # Zones constructibles : U (urbaines) et AU (à urbaniser)
         zones["constructible"] = zones["typezone"].astype(str).str.upper() \
             .str.startswith(("U", "AU"))
-        print(f"[✓] {len(zones):,} zones PLU reçues "
+        print(f"[OK] {len(zones):,} zones PLU reçues "
               f"({int(zones['constructible'].sum()):,} constructibles U/AU).")
 
-        # Document en vigueur (idurba, date d'approbation, id GPU)
+        # Communes du code postal sans zonage reçu (document non publié
+        # ou hors périmètre) : leurs parcelles resteront « non constructibles ».
+        parts_recues = set(zones["partition"].astype(str).unique())
+        sans_zonage = [c for c in communes["code_insee"]
+                       if f"DU_{c}" not in parts_recues]
+        if sans_zonage:
+            noms = ", ".join(communes.loc[communes["code_insee"]
+                                           .isin(sans_zonage), "nom_commune"])
+            print(f"[!] Communes sans zonage PLU reçu : {noms}",
+                  file=sys.stderr)
+
+        # Documents d'urbanisme en vigueur : un code postal peut couvrir
+        # plusieurs communes, donc plusieurs PLU (un gpu_doc_id par
+        # document). Le taux d'emprise au sol est extrait du règlement
+        # écrit (PDF) de CHACUN d'eux (boucle plus bas).
+        if "gpu_doc_id" in zones.columns:
+            gpu_doc_ids = [str(d).strip() for d in
+                           zones["gpu_doc_id"].dropna().unique().tolist()
+                           if str(d).strip()]
+        else:
+            gpu_doc_ids = []
+        nb_docs = len(gpu_doc_ids)
+        # Document le plus représenté (affiché dans la synthèse)
         try:
-            idurba, datvalid, gpu_doc_id = \
+            idurba, datvalid, _ = \
                 zones.groupby(["idurba", "datvalid", "gpu_doc_id"]) \
                 .size().idxmax()
         except (KeyError, ValueError):
-            idurba, datvalid, gpu_doc_id = "inconnu", "", ""
+            idurba, datvalid = "inconnu", ""
         if isinstance(datvalid, str) and len(datvalid) == 8:
             datvalid = f"{datvalid[:4]}-{datvalid[4:6]}-{datvalid[6:]}"
 
@@ -789,6 +1035,11 @@ def main():
         cols_z = ["libelle", "typezone"]
         if "libelong" in zones.columns:
             cols_z.append("libelong")
+        # gpu_doc_id : document d'urbanisme de la zone — indispensable quand
+        # le code postal couvre plusieurs PLU (un règlement par document).
+        for col in ("gpu_doc_id", "partition"):
+            if col in zones.columns:
+                cols_z.append(col)
         zr = zones[cols_z + ["constructible", "geometry"]].copy()
         zr.insert(0, "id_zone", range(len(zr)))
         # reset_index : une parcelle intersectant plusieurs zones apparaît
@@ -813,6 +1064,10 @@ def main():
 
         tableau["code_zone"] = tableau["id"].map(dom_z["libelle"])
         tableau["typezone"] = tableau["id"].map(dom_z["typezone"])
+        if "gpu_doc_id" in dom_z.columns:
+            tableau["gpu_doc_id"] = tableau["id"].map(dom_z["gpu_doc_id"])
+        else:
+            tableau["gpu_doc_id"] = float("nan")
         if "libelong" in dom_z.columns:
             tableau["libelle_zone"] = tableau["id"].map(dom_z["libelong"])
         tableau["surface_en_zone_m2"] = tableau["id"].map(
@@ -824,7 +1079,7 @@ def main():
             surf_zc).fillna(0).round(0)
 
         nb_en_zc = int((tableau["en_zone_constructible"] == "Oui").sum())
-        print(f"[✓] {nb_en_zc:,} parcelles en zone constructible "
+        print(f"[OK] {nb_en_zc:,} parcelles en zone constructible "
               f"(U/AU) sur {len(tableau):,}.")
 
         # Taux d'emprise au sol : d'abord les prescriptions surfaciques
@@ -868,27 +1123,53 @@ def main():
                          .set_index("id_parcelle"))
                 tableau["taux_emprise_pct"] = tableau["id"].map(dom_p["taux"])
                 source_taux = "prescriptions PLU (WFS)"
-                print(f"[✓] Taux d'emprise structurés : "
+                print(f"[OK] Taux d'emprise structurés : "
                       f"{int(tableau['taux_emprise_pct'].notna().sum()):,} "
                       f"parcelles couvertes.")
 
-        if int(tableau["taux_emprise_pct"].notna().sum()) == 0:
-            # Pas de prescription structurée : lire le règlement écrit (PDF)
-            pdf = telecharger_reglement_gpu(gpu_doc_id)
+        # Compléter par le règlement écrit (PDF) : les prescriptions WFS
+        # ne couvrent pas toujours toutes les zones, et un code postal peut
+        # rassembler plusieurs PLU — on lit le règlement de chaque document
+        # pour les parcelles qui n'ont pas encore de taux.
+        nb_avant_pdf = int(tableau["taux_emprise_pct"].notna().sum())
+        for doc in gpu_doc_ids:
+            reste = (tableau["taux_emprise_pct"].isna() &
+                     (tableau["gpu_doc_id"] == doc))
+            if not reste.any():
+                continue
+            pdf = telecharger_reglement_gpu(doc)
             articles = extraire_taux_emprise_reglement(pdf) if pdf else None
-            if articles:
-                source_taux = "règlement écrit (PDF)"
-                taux_pdf = pd.Series(
-                    [taux_emprise_zone(z, s, articles)
-                     for z, s in zip(tableau["code_zone"],
-                                     tableau["surface_m2"])],
-                    index=tableau.index, dtype="float64")
-                masque_pdf = tableau["taux_emprise_pct"].isna()
-                tableau.loc[masque_pdf, "taux_emprise_pct"] = \
-                    taux_pdf[masque_pdf]
-                print(f"[✓] Taux d'emprise issus du règlement : "
-                      f"{int(tableau['taux_emprise_pct'].notna().sum()):,} "
-                      f"parcelles couvertes.")
+            if not articles:
+                continue
+            sel = tableau[reste]
+            taux_pdf = pd.Series(
+                [taux_emprise_zone(z, s, articles)
+                 for z, s in zip(sel["code_zone"], sel["surface_m2"])],
+                index=sel.index, dtype="float64")
+            tableau.loc[reste, "taux_emprise_pct"] = taux_pdf
+            print(f"[OK] Règlement {doc[:8]}… : "
+                  f"{int(taux_pdf.notna().sum()):,} taux extraits "
+                  f"({int(reste.sum()):,} parcelles sans prescription WFS).")
+        if int(tableau["taux_emprise_pct"].notna().sum()) > nb_avant_pdf:
+            source_taux = ("règlement écrit (PDF)"
+                           if source_taux == "aucune"
+                           else source_taux + " + règlement écrit (PDF)")
+
+        # Taux théorique par défaut : 35 % pour les parcelles en zone
+        # constructible dont aucune règle d'emprise au sol n'a été trouvée
+        # (la colonne « taux_emprise_source » indique l'origine du taux).
+        tableau["taux_emprise_source"] = ""
+        tableau.loc[tableau["taux_emprise_pct"].notna(),
+                    "taux_emprise_source"] = "PLU"
+        masque_theo = (tableau["taux_emprise_pct"].isna() &
+                       (tableau["en_zone_constructible"] == "Oui"))
+        if masque_theo.any():
+            tableau.loc[masque_theo, "taux_emprise_pct"] = 35.0
+            tableau.loc[masque_theo, "taux_emprise_source"] = \
+                "théorique (35 % par défaut)"
+            print(f"[i] {int(masque_theo.sum()):,} parcelles en zone "
+                  f"constructible sans règle d'emprise : taux théorique "
+                  f"de 35 % appliqué.")
 
         # Emprise au sol maximale = taux x surface de la parcelle.
         # Hypothèse : la base de calcul est la parcelle cadastrale entière
@@ -912,14 +1193,21 @@ def main():
                           (bati > 0)).sum())
         nb_att = int((tableau["emprise_max_atteinte"] == "Oui").sum())
         nb_taux = int(tableau["taux_emprise_pct"].notna().sum())
+        nb_theo = int(tableau["taux_emprise_source"]
+                      .str.startswith("théorique").sum())
         surf_tot_zones = float(zones.geometry.area.sum())
         surf_zc_tot = float(zones.loc[zones["constructible"], "geometry"]
                             .area.sum())
+        lib_nb_docs = f"{nb_docs:,}" if nb_docs else "inconnu"
         bloc_plu = (
             f"{'=' * 55}\n"
             f"PLU — ZONES CONSTRUCTIBLES (Géoportail de l'urbanisme)\n"
             f"{'=' * 55}\n"
-            f"Document en vigueur      : {idurba} (approuvé le {datvalid})\n"
+            f"Documents d'urbanisme    : {lib_nb_docs:>15}\n")
+        if idurba != "inconnu":
+            bloc_plu += (f"  doc. le plus fréquent  : {idurba} "
+                         f"(approuvé le {datvalid})\n")
+        bloc_plu += (
             f"Surface zones U + AU     : {surf_zc_tot / 1e6:>13,.3f} km²"
             f"  ({100 * surf_zc_tot / max(surf_tot_zones, 1):>6.2f} %"
             f" du territoire)\n"
@@ -927,6 +1215,7 @@ def main():
             f"  dont déjà bâties       : {nb_bati_zc:>15,}\n"
             f"Taux d'emprise au sol    : {source_taux}\n"
             f"Parcelles avec taux connu: {nb_taux:>15,}\n"
+            f"  dont taux théoriques   : {nb_theo:>15,}\n"
             f"Emprise max atteinte     : {nb_att:>15,}\n")
         stats += bloc_plu
         print(bloc_plu)
@@ -941,8 +1230,9 @@ def main():
                     "surface_m2", "code_zone", "typezone", "libelle_zone",
                     "en_zone_constructible", "surface_en_zone_m2",
                     "surface_en_zone_constructible_m2", "surface_batie_m2",
-                    "taux_bati_pct", "taux_emprise_pct", "emprise_max_m2",
-                    "emprise_max_atteinte", "prix_m2_bati", "nb_ventes", "id"]
+                    "taux_bati_pct", "taux_emprise_pct", "taux_emprise_source",
+                    "emprise_max_m2", "emprise_max_atteinte", "prix_m2_bati",
+                    "nb_ventes", "id"]
         vue_plu = tab_plu[[c for c in cols_plu if c in tab_plu.columns]] \
             .rename(columns={"id": "id_parcelle"}) \
             .sort_values(["nom_commune", "numero_parcelle"])
@@ -950,11 +1240,21 @@ def main():
         zones_tab["surface_m2"] = zones_tab.geometry.area.round(0)
         if "libelong" not in zones_tab.columns:
             zones_tab["libelong"] = zones_tab["typezone"]
-        zones_tab = (zones_tab.groupby(["libelle", "typezone"], as_index=False)
-                     .agg(libelle_zone=("libelong", "first"),
-                          constructible=("constructible", "first"),
-                          surface_m2=("surface_m2", "sum"),
-                          nb_secteurs=("libelle", "size"))
+        # partition + gpu_doc_id : un code postal peut couvrir plusieurs
+        # PLU ; les inclure dans les clés évite de fusionner des zones
+        # homonymes appartenant à des règlements différents.
+        cles_zones = [c for c in ("partition", "gpu_doc_id")
+                      if c in zones_tab.columns]
+        cles_zones += ["libelle", "typezone"]
+        agg_zones = {"libelle_zone": ("libelong", "first"),
+                     "constructible": ("constructible", "first"),
+                     "surface_m2": ("surface_m2", "sum"),
+                     "nb_secteurs": ("libelle", "size")}
+        for col in ("partition", "gpu_doc_id"):
+            if col in zones_tab.columns:
+                agg_zones[col] = (col, "first")
+        zones_tab = (zones_tab.groupby(cles_zones, as_index=False)
+                     .agg(**agg_zones)
                      .rename(columns={"libelle": "code_zone"}))
         zones_tab["constructible"] = zones_tab["constructible"] \
             .map({True: "Oui", False: "Non"})
@@ -970,7 +1270,7 @@ def main():
                                  index=False)
                 zones_tab.to_excel(writer, sheet_name="Zones du PLU",
                                    index=False)
-            print(f"[✓] Excel constructibilité : {xlsx_plu}")
+            print(f"[OK] Excel constructibilité : {xlsx_plu}")
         except Exception as exc:
             csv_plu = os.path.join(OUT_DIR, "tableau_constructibilite.csv")
             vue_plu.to_csv(csv_plu, index=False, sep=";")
@@ -980,7 +1280,7 @@ def main():
         # Carte des zones constructibles (fond IGN, comme la carte parcelles)
         try:
             import folium
-            print("[⋯] Carte des zones constructibles...")
+            print("[...] Carte des zones constructibles...")
             tab_carte = tab_plu.to_crs(4326)
             zones_carte = zones.to_crs(4326)
             bounds = tab_carte.total_bounds
@@ -1072,7 +1372,7 @@ def main():
             folium.LayerControl().add_to(carte_z)
             carte_z.save(os.path.join(OUT_DIR,
                                       "carte_zones_constructibles.html"))
-            print(f"[✓] Carte zones constructibles : "
+            print(f"[OK] Carte zones constructibles : "
                   f"{OUT_DIR}/carte_zones_constructibles.html")
         except Exception:
             import traceback
@@ -1105,7 +1405,7 @@ def main():
                                                 "numero_parcelle"])
 
     xlsx_path = os.path.join(OUT_DIR, "tableau_parcelles.xlsx")
-    print("[⋯] Export Excel...")
+    print("[...] Export Excel...")
     try:
         with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
             sans_geom = export.drop(columns="geometry")
@@ -1123,13 +1423,13 @@ def main():
                 nom_feuille = str(com["nom_commune"])[:28]
                 if len(onglet) and nom_feuille not in writer.sheets:
                     onglet.to_excel(writer, sheet_name=nom_feuille, index=False)
-        print(f"[✓] Excel exporté : {xlsx_path}")
+        print(f"[OK] Excel exporté : {xlsx_path}")
     except Exception as exc:
         csv_path = os.path.join(OUT_DIR, "tableau_parcelles.csv")
         export.drop(columns="geometry").to_csv(csv_path, index=False, sep=";")
         print(f"[!] Excel impossible ({exc}), CSV exporté : {csv_path}",
               file=sys.stderr)
-        print("    → Pour l'Excel : pip install openpyxl", file=sys.stderr)
+        print("    -> Pour l'Excel : pip install openpyxl", file=sys.stderr)
 
     # -------------------------------------------------- 7. Stats par commune du code postal
     par_commune = (export.drop(columns="geometry")
@@ -1153,12 +1453,12 @@ def main():
         fig3.tight_layout()
         fig3.savefig(os.path.join(OUT_DIR, "emprise_batie_communes.png"), dpi=150)
         plt.close(fig3)
-        print("[✓] Graphique d'emprise bâtie exporté.")
+        print("[OK] Graphique d'emprise bâtie exporté.")
 
     # -------------------------------------------------- 8. Carte interactive
     try:
         import folium
-        print("[⋯] Carte interactive...")
+        print("[...] Carte interactive...")
         # Folium/Leaflet attend des coordonnées WGS84 (lat/lon) : les
         # géométries cadastrales sont en Lambert-93 (mètres), il faut donc
         # reprojeter avant l'affichage, sans quoi la carte est centrée
@@ -1243,7 +1543,7 @@ def main():
                   encoding="utf-8") as f:
             f.write(geojson_str)
         carte.save(os.path.join(OUT_DIR, "carte_parcelles.html"))
-        print(f"[✓] Carte interactive : {OUT_DIR}/carte_parcelles.html "
+        print(f"[OK] Carte interactive : {OUT_DIR}/carte_parcelles.html "
               f"({len(carte_gdf):,} parcelles)")
     except Exception:
         import traceback
@@ -1253,8 +1553,9 @@ def main():
     with open(os.path.join(OUT_DIR, "stats_synthese.txt"), "w", encoding="utf-8") as f:
         f.write(stats)
     print(stats)
-    print(f"[✓] Terminé. Résultats dans ./{OUT_DIR}/")
+    print(f"[OK] Terminé. Résultats dans ./{OUT_DIR}/")
 
 
 if __name__ == "__main__":
+    main()
     main()
